@@ -1,58 +1,44 @@
-import { desc } from "drizzle-orm";
-import { getDb } from "../../../../../db";
-import { notes } from "../../../db/schema";
+import { getDatabase, getUploads } from "@/lib/server-storage";
 
-function toRouteErrorMessage(error: unknown) {
-  const message = error instanceof Error ? error.message : "Unexpected error";
-  const detail =
-    error instanceof Error && error.cause instanceof Error ? error.cause.message : "";
-  const combined = `${message}\n${detail}`;
-
-  if (combined.includes("no such table") || combined.includes('from "notes"')) {
-    return "The notes table is unavailable. Generate the migration locally with `npm run db:generate`, then deploy so the platform can apply the generated SQL to the real D1 database.";
-  }
-
-  return message;
-}
-
-export async function GET() {
-  try {
-    const db = getDb();
-    const rows = await db
-      .select()
-      .from(notes)
-      .orderBy(desc(notes.createdAt), desc(notes.id))
-      .limit(20);
-
-    return Response.json({ notes: rows });
-  } catch (error) {
-    return Response.json(
-      { error: toRouteErrorMessage(error) },
-      { status: 500 }
-    );
-  }
-}
+const allowedTypes = new Set(["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"]);
+const value = (form: FormData, key: string) => String(form.get(key) ?? "").trim();
 
 export async function POST(request: Request) {
   try {
-    const payload = (await request.json()) as {
-      title?: string;
-      content?: string;
-    };
-    const title = payload.title?.trim() ?? "";
-    const content = payload.content?.trim() ?? "";
+    const form = await request.formData();
+    const firstName = value(form, "firstName");
+    const email = value(form, "email").toLowerCase();
+    const phone = value(form, "phone");
+    const postcode = value(form, "postcode").toUpperCase();
+    const town = value(form, "town");
+    const category = value(form, "category");
+    const urgency = value(form, "urgency");
+    const propertyType = value(form, "propertyType");
+    const description = value(form, "description");
+    const consent = value(form, "consent") === "true";
 
-    if (!title) {
-      return Response.json({ error: "title is required" }, { status: 400 });
+    if (!firstName || !email || !phone || !postcode || !category || !urgency || !propertyType || description.length < 20 || !consent) {
+      return Response.json({ error: "Please complete every required field and provide at least 20 characters about the job." }, { status: 400 });
+    }
+    if (!email.includes("@") || phone.replace(/\D/g, "").length < 10) {
+      return Response.json({ error: "Please enter a valid email address and phone number." }, { status: 400 });
     }
 
-    const db = getDb();
-    const [note] = await db.insert(notes).values({ title, content }).returning();
-    return Response.json({ note }, { status: 201 });
-  } catch (error) {
-    return Response.json(
-      { error: toRouteErrorMessage(error) },
-      { status: 500 }
-    );
+    const id = crypto.randomUUID();
+    const files = form.getAll("photos").filter((item): item is File => item instanceof File && item.size > 0).slice(0, 5);
+    const photoKeys: string[] = [];
+    const bucket = getUploads();
+    for (const file of files) {
+      if (!allowedTypes.has(file.type) || file.size > 5_000_000) continue;
+      const extension = file.name.split(".").pop()?.replace(/[^a-z0-9]/gi, "").toLowerCase() || "jpg";
+      const key = `jobs/${id}/${crypto.randomUUID()}.${extension}`;
+      await bucket.put(key, await file.arrayBuffer(), { httpMetadata: { contentType: file.type } });
+      photoKeys.push(key);
+    }
+
+    await getDatabase().prepare(`INSERT INTO jobs (id, first_name, email, phone, postcode, town, category, urgency, property_type, description, photo_keys, consent, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'submitted')`).bind(id, firstName, email, phone, postcode, town, category, urgency, propertyType, description, JSON.stringify(photoKeys), consent ? 1 : 0).run();
+    return Response.json({ id, message: "Your enquiry has been sent to J&L Welch Roofing for review." }, { status: 201 });
+  } catch {
+    return Response.json({ error: "We could not submit the job. Please try again." }, { status: 500 });
   }
 }
